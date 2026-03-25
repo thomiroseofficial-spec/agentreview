@@ -394,55 +394,32 @@ class TestFetchProducts:
 
 
 class TestFetchReviewsForProduct:
-    @respx.mock
-    def test_fetches_reviews(self, monkeypatch):
-        monkeypatch.setattr("scrape.DELAY_BETWEEN_REQUESTS", 0)
-        respx.get(NAVER_REVIEW_URL).respond(
-            200,
-            json={
-                "reviews": [
-                    {
-                        "reviewId": "r1",
-                        "content": "좋아요",
-                        "starScore": 5,
-                        "createDate": "2024-01-15T10:00:00",
-                        "purchaseVerified": True,
-                    }
-                ],
-                "totalPages": 1,
-            },
-        )
+    def test_legacy_returns_empty(self):
+        """fetch_reviews_for_product is legacy (봇 감지로 비활성화) — 항상 빈 리스트 반환."""
         with httpx.Client() as client:
-            reviews = fetch_reviews_for_product(client, "prod_1", max_pages=1)
-        assert len(reviews) == 1
-        assert reviews[0]["text"] == "좋아요"
-        assert reviews[0]["rating"] == 5
-
-    @respx.mock
-    def test_stops_on_403(self, monkeypatch):
-        monkeypatch.setattr("scrape.DELAY_BETWEEN_REQUESTS", 0)
-        respx.get(NAVER_REVIEW_URL).respond(403)
-        with httpx.Client() as client:
-            reviews = fetch_reviews_for_product(client, "blocked", max_pages=1)
+            reviews = fetch_reviews_for_product(client, "any_product", max_pages=1)
         assert reviews == []
 
-    @respx.mock
-    def test_stops_on_schema_change(self, monkeypatch):
-        monkeypatch.setattr("scrape.DELAY_BETWEEN_REQUESTS", 0)
-        respx.get(NAVER_REVIEW_URL).respond(
-            200, json={"unexpected": "structure", "count": 42}
-        )
-        with httpx.Client() as client:
-            reviews = fetch_reviews_for_product(client, "changed", max_pages=1)
-        assert reviews == []
 
-    @respx.mock
-    def test_handles_empty_reviews(self, monkeypatch):
-        monkeypatch.setattr("scrape.DELAY_BETWEEN_REQUESTS", 0)
-        respx.get(NAVER_REVIEW_URL).respond(200, json={"reviews": []})
-        with httpx.Client() as client:
-            reviews = fetch_reviews_for_product(client, "empty", max_pages=1)
-        assert reviews == []
+# ---------------------------------------------------------------------------
+# _extract_review_from_element (unit test for browser extraction logic)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractReviewFromElement:
+    def test_normalize_review_still_works(self):
+        """Playwright 전환 후에도 _normalize_review는 정상 동작해야 함."""
+        raw = {
+            "reviewId": "r1",
+            "content": "배송 빠르고 좋아요",
+            "starScore": 5,
+            "createDate": "2024-03-15T09:00:00",
+            "purchaseVerified": True,
+        }
+        from scrape import _normalize_review
+        result = _normalize_review(raw, "prod_001")
+        assert result["text"] == "배송 빠르고 좋아요"
+        assert result["rating"] == 5
 
 
 # ---------------------------------------------------------------------------

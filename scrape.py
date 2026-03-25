@@ -130,7 +130,7 @@ def fetch_products(
             "query": query,
             "display": display,
             "start": start,
-            "sort": "review",  # 리뷰 많은 순
+            "sort": "sim",  # 정확도순 (review는 미지원)
         }
 
         resp = _request_with_retry(
@@ -172,78 +172,167 @@ def _clean_html(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: 상품별 리뷰 수집 (XHR 엔드포인트)
+# Step 2: 상품별 리뷰 수집 (Playwright 브라우저)
 # ---------------------------------------------------------------------------
 
 
+def fetch_reviews_for_product_browser(
+    page,  # playwright Page object
+    product_id: str,
+    product_link: str,
+    max_reviews: int = 100,
+) -> list[dict]:
+    """Playwright로 네이버쇼핑 카탈로그 페이지에서 리뷰를 수집합니다."""
+    reviews = []
+
+    try:
+        page.goto(product_link, wait_until="domcontentloaded", timeout=15000)
+        time.sleep(2)  # 페이지 로딩 대기
+
+        # 리뷰 탭 클릭 시도
+        review_tab = page.locator('a:has-text("리뷰"), button:has-text("리뷰")')
+        if review_tab.count() > 0:
+            review_tab.first.click()
+            time.sleep(2)
+
+        # 리뷰 요소 수집
+        collected = 0
+        max_scroll_attempts = 10
+        scroll_attempt = 0
+
+        while collected < max_reviews and scroll_attempt < max_scroll_attempts:
+            # 리뷰 요소들을 찾기 (여러 가능한 셀렉터)
+            review_elements = _find_review_elements(page)
+
+            if not review_elements:
+                if scroll_attempt == 0:
+                    print(f"  [NO REVIEWS] product {product_id}")
+                break
+
+            for el in review_elements[collected:]:
+                review = _extract_review_from_element(el, product_id)
+                if review and review["review_id"] not in {r["review_id"] for r in reviews}:
+                    reviews.append(review)
+                    collected += 1
+                    if collected >= max_reviews:
+                        break
+
+            # 더보기 버튼 또는 스크롤
+            more_btn = page.locator(
+                'a:has-text("더보기"), button:has-text("더보기"), '
+                'a:has-text("more"), button:has-text("more")'
+            )
+            if more_btn.count() > 0 and more_btn.first.is_visible():
+                more_btn.first.click()
+                time.sleep(1.5)
+            else:
+                # 다음 페이지 버튼
+                next_btn = page.locator(
+                    'a.pagination_next__aKyU0, button[aria-label="다음"], '
+                    'a:has-text("다음")'
+                )
+                if next_btn.count() > 0 and next_btn.first.is_visible():
+                    next_btn.first.click()
+                    time.sleep(2)
+                else:
+                    page.evaluate("window.scrollBy(0, 1000)")
+                    time.sleep(1)
+
+            new_elements = _find_review_elements(page)
+            if len(new_elements) <= len(review_elements):
+                scroll_attempt += 1
+            else:
+                scroll_attempt = 0
+
+    except Exception as e:
+        print(f"  [BROWSER ERROR] product {product_id}: {e}")
+
+    return reviews
+
+
+def _find_review_elements(page) -> list:
+    """페이지에서 리뷰 요소를 찾습니다."""
+    # 네이버쇼핑 카탈로그 리뷰 셀렉터 (여러 패턴 시도)
+    selectors = [
+        'li[class*="reviewItems_review"]',
+        'div[class*="reviewItems_review"]',
+        'li[class*="review_list"]',
+        'div[class*="review_item"]',
+        'li[class*="BnwL_"]',  # 스마트스토어 패턴
+        'div[class*="review_section"] li',
+        'ul[class*="review"] > li',
+    ]
+
+    for selector in selectors:
+        elements = page.locator(selector).all()
+        if elements:
+            return elements
+
+    return []
+
+
+def _extract_review_from_element(el, product_id: str) -> dict | None:
+    """Playwright 요소에서 리뷰 데이터를 추출합니다."""
+    try:
+        # 텍스트 추출
+        text_el = el.locator(
+            '[class*="reviewItems_text"], [class*="review_text"], '
+            '[class*="reviewContent"], [class*="YEtwtBpuoY"], p'
+        )
+        text = text_el.first.inner_text() if text_el.count() > 0 else ""
+        text = text.strip()
+
+        if not text or len(text) < 5:
+            return None
+
+        # 별점 추출
+        rating = None
+        star_el = el.locator(
+            '[class*="reviewItems_average"], [class*="star_score"], '
+            '[class*="rating"], em'
+        )
+        if star_el.count() > 0:
+            star_text = star_el.first.inner_text().strip()
+            import re
+            nums = re.findall(r"\d+", star_text)
+            if nums:
+                rating = int(nums[0])
+                if rating > 5:
+                    rating = round(rating / 20)  # 100점 스케일 → 5점
+
+        # 날짜 추출
+        date_str = None
+        date_el = el.locator(
+            '[class*="reviewItems_date"], [class*="review_date"], '
+            '[class*="date"], time, span:has-text("20")'
+        )
+        if date_el.count() > 0:
+            date_text = date_el.first.inner_text().strip()
+            date_str = _parse_date(date_text)
+
+        # 리뷰 ID 생성
+        review_id = f"{product_id}_{hash(text) % 10**8}"
+
+        return {
+            "product_id": product_id,
+            "review_id": review_id,
+            "rating": rating,
+            "text": text,
+            "date": date_str,
+            "verified_purchase": False,  # 브라우저에서 정확히 판별 어려움
+        }
+    except Exception:
+        return None
+
+
+# Legacy function kept for tests
 def fetch_reviews_for_product(
     client: httpx.Client,
     product_id: str,
     max_pages: int = 5,
 ) -> list[dict]:
-    """네이버쇼핑 내부 리뷰 API에서 리뷰를 수집합니다."""
-    reviews = []
-
-    for page in range(1, max_pages + 1):
-        params = {
-            "nvMid": product_id,
-            "reviewType": "ALL",
-            "page": page,
-            "pageSize": 20,
-            "sortType": "RECENT",
-        }
-
-        try:
-            resp = _request_with_retry(
-                client,
-                NAVER_REVIEW_URL,
-                params=params,
-                headers=HEADERS_REVIEW,
-            )
-        except RuntimeError:
-            print(f"  [SKIP] product {product_id} page {page} — retries exhausted")
-            break
-
-        if resp.status_code == 403:
-            print(f"  [BLOCKED] product {product_id} — 403 Forbidden")
-            break
-
-        if resp.status_code != 200:
-            print(
-                f"  [SKIP] product {product_id} page {page} "
-                f"— status {resp.status_code}"
-            )
-            break
-
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            print(f"  [PARSE ERROR] product {product_id} page {page}")
-            break
-
-        # 스키마 검증: 응답 구조가 예상과 다르면 중단
-        review_items = _extract_review_items(data)
-        if review_items is None:
-            print(
-                f"  [SCHEMA CHANGED] product {product_id} — "
-                f"unexpected response structure. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
-            )
-            break
-
-        if not review_items:
-            break  # 더 이상 리뷰 없음
-
-        for item in review_items:
-            review = _normalize_review(item, product_id)
-            if review:
-                reviews.append(review)
-
-        # 마지막 페이지 감지
-        total_pages = _get_total_pages(data)
-        if total_pages and page >= total_pages:
-            break
-
-    return reviews
+    """네이버쇼핑 내부 리뷰 API에서 리뷰를 수집합니다 (봇 감지로 현재 사용 불가)."""
+    return []
 
 
 def _extract_review_items(data: dict) -> list[dict] | None:
@@ -490,36 +579,51 @@ def main():
         print("ERROR: HF_TOKEN 환경변수를 설정하세요.")
         sys.exit(1)
 
+    max_reviews = args.max_review_pages * 20  # 페이지당 ~20개
+
     print(f"=== agentreview MVP ===")
     print(f"Query: {args.query}")
     print(f"Max products: {args.max_products}")
-    print(f"Max review pages per product: {args.max_review_pages}")
+    print(f"Max reviews per product: {max_reviews}")
     print()
 
+    # Step 1: 상품 목록 수집 (httpx — 공식 API)
     with httpx.Client() as client:
-        # Step 1: 상품 목록 수집
         products = fetch_products(
             client, args.query, args.max_products, client_id, client_secret
         )
 
-        if not products:
-            print("ERROR: 상품을 찾을 수 없습니다.")
-            sys.exit(1)
+    if not products:
+        print("ERROR: 상품을 찾을 수 없습니다.")
+        sys.exit(1)
 
-        # Step 2: 리뷰 수집
-        all_reviews = []
+    # Step 2: 리뷰 수집 (Playwright — 브라우저)
+    from playwright.sync_api import sync_playwright
+
+    all_reviews = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="ko-KR",
+        )
+        page = context.new_page()
+
         for i, product in enumerate(products):
             pid = product["product_id"]
             pname = product["product_name"][:30]
-            print(
-                f"[{i + 1}/{len(products)}] {pname}... (id: {pid})"
+            link = product["link"]
+            print(f"[{i + 1}/{len(products)}] {pname}... (id: {pid})")
+
+            reviews = fetch_reviews_for_product_browser(
+                page, pid, link, max_reviews=max_reviews
             )
 
-            reviews = fetch_reviews_for_product(
-                client, pid, max_pages=args.max_review_pages
-            )
-
-            # 상품 정보 병합
             for r in reviews:
                 r["platform"] = "naver"
                 r["product_name"] = product["product_name"]
@@ -528,25 +632,29 @@ def main():
             all_reviews.extend(reviews)
             print(f"  → {len(reviews)}개 리뷰 수집")
 
-        # Zero-result 감지
-        if not all_reviews:
-            print(
-                "\nERROR: 리뷰를 하나도 수집하지 못했습니다.\n"
-                "가능한 원인:\n"
-                "  1. 네이버 리뷰 API 엔드포인트가 변경되었을 수 있습니다\n"
-                "  2. IP가 차단되었을 수 있습니다\n"
-                "  3. 검색 결과 상품에 리뷰가 없을 수 있습니다"
-            )
-            sys.exit(1)
+            time.sleep(DELAY_BETWEEN_REQUESTS)
 
-        print(f"\n[TOTAL] {len(all_reviews)}개 리뷰 수집 완료")
+        browser.close()
 
-        # Step 3-4: 내보내기
-        json_path, parquet_path = export_data(all_reviews, args.query)
+    # Zero-result 감지
+    if not all_reviews:
+        print(
+            "\nERROR: 리뷰를 하나도 수집하지 못했습니다.\n"
+            "가능한 원인:\n"
+            "  1. 네이버 리뷰 페이지 구조가 변경되었을 수 있습니다\n"
+            "  2. IP가 차단되었을 수 있습니다\n"
+            "  3. 검색 결과 상품에 리뷰가 없을 수 있습니다"
+        )
+        sys.exit(1)
 
-        # Step 5: 업로드 (선택)
-        if args.upload:
-            upload_to_hub(parquet_path, args.repo_id)
+    print(f"\n[TOTAL] {len(all_reviews)}개 리뷰 수집 완료")
+
+    # Step 3-4: 내보내기
+    json_path, parquet_path = export_data(all_reviews, args.query)
+
+    # Step 5: 업로드 (선택)
+    if args.upload:
+        upload_to_hub(parquet_path, args.repo_id)
 
     print("\n=== 완료 ===")
 

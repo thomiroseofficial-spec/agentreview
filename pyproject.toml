@@ -10,6 +10,7 @@ dependencies = [
     "pyarrow>=17.0",
     "datasets>=3.0",
     "huggingface-hub>=0.25",
+    "playwright>=1.49",
 ]
 
 [project.scripts]
