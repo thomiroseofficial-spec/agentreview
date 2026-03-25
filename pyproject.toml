@@ -1,0 +1,16 @@
+[project]
+name = "agentreview"
+version = "0.1.0"
+description = "Product review dataset for AI shopping agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+    "datasets>=3.0",
+    "huggingface-hub>=0.25",
+]
+
+[project.scripts]
+agentreview = "scrape:main"
