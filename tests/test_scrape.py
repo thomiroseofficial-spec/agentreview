@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import httpx
 import pandas as pd
@@ -20,7 +19,6 @@ from scrape import (
     export_data,
     fetch_products,
     fetch_reviews_for_product,
-    NAVER_REVIEW_URL,
     NAVER_SEARCH_URL,
 )
 
@@ -42,6 +40,9 @@ class TestCleanHtml:
 
     def test_empty_string(self):
         assert _clean_html("") == ""
+
+    def test_decodes_html_entities(self):
+        assert _clean_html("A &amp; B &quot;C&quot;") == 'A & B "C"'
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +76,14 @@ class TestParseDate:
         result = _parse_date("2024-01-15T10:30:00+09:00")
         assert result == "2024-01-15"
 
-    def test_short_string(self):
-        assert _parse_date("2024") is None
+    def test_garbage_returns_none(self):
+        assert _parse_date("not a date at all") is None
 
-    def test_garbage(self):
-        result = _parse_date("not a date at all")
-        # Should not crash
-        assert result is None or isinstance(result, str)
+    def test_short_string_returns_none(self):
+        assert _parse_date("abc") is None
+
+    def test_empty_returns_none(self):
+        assert _parse_date("") is None
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +213,27 @@ class TestNormalizeReview:
         raw = {"reviewId": "1", "content": "한글 리뷰 🎧 특수문자!", "starScore": 3}
         result = _normalize_review(raw, "p1")
         assert result["text"] == "한글 리뷰 🎧 특수문자!"
+
+    def test_float_rating(self):
+        raw = {"reviewId": "1", "content": "좋아요", "rating": "4.7"}
+        result = _normalize_review(raw, "p1")
+        assert result["rating"] == 5  # rounded
+
+    def test_string_false_verified(self):
+        raw = {"reviewId": "1", "content": "좋아요", "verified": "false"}
+        result = _normalize_review(raw, "p1")
+        assert result["verified_purchase"] is False
+
+    def test_string_true_verified(self):
+        raw = {"reviewId": "1", "content": "좋아요", "verified": "true"}
+        result = _normalize_review(raw, "p1")
+        assert result["verified_purchase"] is True
+
+    def test_stable_review_id_across_calls(self):
+        raw = {"content": "동일한 텍스트"}
+        r1 = _normalize_review(raw, "p1")
+        r2 = _normalize_review(raw, "p1")
+        assert r1["review_id"] == r2["review_id"]  # stable hash
 
 
 # ---------------------------------------------------------------------------

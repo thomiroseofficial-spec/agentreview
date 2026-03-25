@@ -20,8 +20,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import html
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -35,7 +38,6 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 NAVER_SEARCH_URL = "https://openapi.naver.com/v1/search/shop.json"
-NAVER_REVIEW_URL = "https://search.shopping.naver.com/api/review"
 
 DATA_DIR = Path("data")
 
@@ -54,17 +56,6 @@ V1_COLUMNS = [
     "date",
     "verified_purchase",
 ]
-
-HEADERS_REVIEW = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "Referer": "https://search.shopping.naver.com/",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +156,8 @@ def fetch_products(
 
 
 def _clean_html(text: str) -> str:
-    """Remove HTML tags from Naver API response."""
-    import re
-
-    return re.sub(r"<[^>]+>", "", text)
+    """Remove HTML tags and decode entities from Naver API response."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +185,11 @@ def fetch_reviews_for_product_browser(
             time.sleep(2)
 
         # 리뷰 요소 수집
-        collected = 0
+        seen_ids: set[str] = set()
         max_scroll_attempts = 10
         scroll_attempt = 0
 
-        while collected < max_reviews and scroll_attempt < max_scroll_attempts:
-            # 리뷰 요소들을 찾기 (여러 가능한 셀렉터)
+        while len(reviews) < max_reviews and scroll_attempt < max_scroll_attempts:
             review_elements = _find_review_elements(page)
 
             if not review_elements:
@@ -209,12 +197,14 @@ def fetch_reviews_for_product_browser(
                     print(f"  [NO REVIEWS] product {product_id}")
                 break
 
-            for el in review_elements[collected:]:
+            new_found = 0
+            for el in review_elements:
                 review = _extract_review_from_element(el, product_id)
-                if review and review["review_id"] not in {r["review_id"] for r in reviews}:
+                if review and review["review_id"] not in seen_ids:
+                    seen_ids.add(review["review_id"])
                     reviews.append(review)
-                    collected += 1
-                    if collected >= max_reviews:
+                    new_found += 1
+                    if len(reviews) >= max_reviews:
                         break
 
             # 더보기 버튼 또는 스크롤
@@ -238,8 +228,7 @@ def fetch_reviews_for_product_browser(
                     page.evaluate("window.scrollBy(0, 1000)")
                     time.sleep(1)
 
-            new_elements = _find_review_elements(page)
-            if len(new_elements) <= len(review_elements):
+            if new_found == 0:
                 scroll_attempt += 1
             else:
                 scroll_attempt = 0
@@ -311,7 +300,7 @@ def _extract_review_from_element(el, product_id: str) -> dict | None:
             date_str = _parse_date(date_text)
 
         # 리뷰 ID 생성
-        review_id = f"{product_id}_{hash(text) % 10**8}"
+        review_id = f"{product_id}_{hashlib.sha256(text.encode()).hexdigest()[:8]}"
 
         return {
             "product_id": product_id,
@@ -408,12 +397,13 @@ def _normalize_review(raw: dict, product_id: str) -> dict | None:
     if not text:
         return None  # 텍스트 없는 리뷰는 스킵
 
-    # 별점 추출
+    # 별점 추출 (1-5 범위, float도 지원)
     rating = None
     for key in ("starScore", "rating", "score", "star", "grade"):
-        if key in raw:
+        if key in raw and raw[key] is not None:
             try:
-                rating = int(raw[key])
+                val = float(raw[key])
+                rating = max(1, min(5, round(val)))
                 break
             except (ValueError, TypeError):
                 pass
@@ -425,7 +415,7 @@ def _normalize_review(raw: dict, product_id: str) -> dict | None:
             review_id = str(raw[key])
             break
     if not review_id:
-        review_id = f"{product_id}_{hash(text) % 10**8}"
+        review_id = f"{product_id}_{hashlib.sha256(text.encode()).hexdigest()[:8]}"
 
     # 날짜 추출
     date_str = None
@@ -445,7 +435,13 @@ def _normalize_review(raw: dict, product_id: str) -> dict | None:
     verified = False
     for key in ("purchaseVerified", "verified", "isBuyer", "buyerReview"):
         if key in raw:
-            verified = bool(raw[key])
+            val = raw[key]
+            if isinstance(val, bool):
+                verified = val
+            elif isinstance(val, str):
+                verified = val.lower() in ("true", "1", "yes", "y")
+            else:
+                verified = bool(val)
             break
 
     return {
@@ -459,31 +455,37 @@ def _normalize_review(raw: dict, product_id: str) -> dict | None:
 
 
 def _parse_date(date_str: str) -> str | None:
-    """다양한 날짜 형식을 YYYY-MM-DD로 변환합니다."""
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%Y.%m.%d",
-        "%Y.%m.%d.",
-    ):
+    """다양한 날짜 형식을 YYYY-MM-DD로 변환합니다. 파싱 실패 시 None."""
+    if not date_str or len(date_str) < 8:
+        return None
+
+    # Try Python's fromisoformat first (handles most ISO variants)
+    try:
+        # Remove trailing 'Z' for fromisoformat compatibility
+        cleaned = date_str.rstrip("Z")
+        dt = datetime.fromisoformat(cleaned)
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        pass
+
+    # Korean dot format: 2024.01.15 or 2024.01.15.
+    dot_match = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", date_str)
+    if dot_match:
         try:
-            dt = datetime.strptime(date_str[:len(fmt.replace('%', ''))+ 5], fmt)
+            dt = datetime(
+                int(dot_match.group(1)),
+                int(dot_match.group(2)),
+                int(dot_match.group(3)),
+            )
             return dt.strftime("%Y-%m-%d")
         except ValueError:
-            continue
-
-    # ISO format fallback
-    if "T" in date_str:
-        try:
-            return date_str[:10]
-        except Exception:
             pass
 
-    return date_str[:10] if len(date_str) >= 10 else None
+    # Last resort: check if first 10 chars look like YYYY-MM-DD
+    if len(date_str) >= 10 and re.match(r"\d{4}-\d{2}-\d{2}", date_str[:10]):
+        return date_str[:10]
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +506,7 @@ def export_data(reviews: list[dict], query: str) -> tuple[Path, Path]:
     if before != after:
         print(f"[DEDUP] {before - after}개 중복 리뷰 제거")
 
-    timestamp = datetime.now().strftime("%Y%m%d")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_query = "".join(c if c.isalnum() else "_" for c in query)
 
     json_path = DATA_DIR / f"reviews_{safe_query}_{timestamp}.json"
@@ -531,13 +533,20 @@ def upload_to_hub(parquet_path: Path, repo_id: str) -> None:
 
     df = pd.read_parquet(parquet_path)
     ds = Dataset.from_pandas(df)
-    ds.push_to_hub(repo_id, private=False)
+    ds.push_to_hub(repo_id, private=True)
     print(f"[UPLOAD] HuggingFace에 업로드 완료: https://huggingface.co/datasets/{repo_id}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"{value} must be a positive integer")
+    return n
 
 
 def main():
@@ -548,12 +557,11 @@ def main():
         "--query", default="무선이어폰", help="검색 키워드 (default: 무선이어폰)"
     )
     parser.add_argument(
-        "--max-products", type=int, default=50, help="수집할 상품 수 (default: 50)"
+        "--max-products", type=_positive_int, default=50,
+        help="수집할 상품 수 (default: 50)",
     )
     parser.add_argument(
-        "--max-review-pages",
-        type=int,
-        default=5,
+        "--max-review-pages", type=_positive_int, default=5,
         help="상품당 최대 리뷰 페이지 수 (default: 5, 페이지당 20개)",
     )
     parser.add_argument("--upload", action="store_true", help="HuggingFace에 업로드")

@@ -13,10 +13,10 @@ AI 쇼핑 에이전트를 위한 네이버쇼핑 상품 리뷰 데이터셋.
 | `product_name` | string | 상품명 |
 | `category` | string | 카테고리 (예: 디지털/가전/이어폰) |
 | `review_id` | string | 리뷰 고유 ID |
-| `rating` | int | 별점 (1-5) |
+| `rating` | int? | 별점 (1-5, nullable) |
 | `text` | string | 리뷰 본문 |
-| `date` | string | 작성일 (YYYY-MM-DD) |
-| `verified_purchase` | bool | 구매 인증 여부 |
+| `date` | string? | 작성일 (YYYY-MM-DD, nullable) |
+| `verified_purchase` | bool | 구매 인증 여부 (브라우저 수집 시 항상 false) |
 
 ## 설치
 
@@ -24,8 +24,12 @@ AI 쇼핑 에이전트를 위한 네이버쇼핑 상품 리뷰 데이터셋.
 # uv 사용 (권장)
 uv sync
 
+# Playwright 브라우저 설치 (필수)
+uv run playwright install chromium
+
 # pip 사용
 pip install -e .
+playwright install chromium
 ```
 
 ## 사전 준비
@@ -86,8 +90,8 @@ const response = await fetch(
 ## 출력 파일
 
 `data/` 디렉토리에 생성됩니다:
-- `reviews_{query}_{date}.json` — JSON 형식
-- `reviews_{query}_{date}.parquet` — Parquet 형식 (에이전트 통합에 권장)
+- `reviews_{query}_{timestamp}.json` — JSON 형식
+- `reviews_{query}_{timestamp}.parquet` — Parquet 형식 (에이전트 통합에 권장)
 
 ## 법적 고지
 
